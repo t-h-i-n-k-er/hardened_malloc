@@ -81,7 +81,9 @@ EXECUTABLES := \
     malloc_zero_different \
     malloc_noreuse \
     test_adaptive_quarantine_pressure \
-    test_adaptive_quarantine_floor
+    test_adaptive_quarantine_floor \
+    mte_deterministic_uaf \
+    mte_tag_wraparound
 
 all: $(EXECUTABLES)
 

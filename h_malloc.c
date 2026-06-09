@@ -174,6 +174,14 @@ struct slab_metadata {
     // It's intentionally placed at the end of struct to improve locality: for most size classes,
     // slot count is far lower than MAX_SLAB_SLOT_COUNT.
     u8 arm_mte_tags[129];
+#if CONFIG_MTE_DETERMINISTIC_UAF
+    // arm_mte_gen stores a monotonic allocation generation counter per slot.
+    // It increments on each allocation of a slot and wraps at 255.
+    // When the counter reaches 255, the next allocation falls back to random tagging
+    // to avoid silent wrap-around reducing deterministic UAF detection coverage.
+    // MAX_SLAB_SLOT_COUNT is currently 256.
+    u8 arm_mte_gen[256];
+#endif
 #endif
 };
 
@@ -649,15 +657,76 @@ static void *tag_and_clear_slab_slot(struct slab_metadata *metadata, void *slot_
 
     // current or previous tag of left neighbor or 0 if there's no left neighbor or if it was never used
     tem |= (1 << u4_arr_get(slot_tags, slot_idx));
-    // previous tag of this slot or 0 if it was never used
-    tem |= (1 << u4_arr_get(slot_tags, slot_idx + 1));
     // current or previous tag of right neighbor or 0 if there's no right neighbor or if it was never used
     tem |= (1 << u4_arr_get(slot_tags, slot_idx + 2));
 
-    void *tagged_ptr = arm_mte_create_random_tag(slot_ptr, tem);
+    void *tagged_ptr;
+#if CONFIG_MTE_DETERMINISTIC_UAF
+    // previous tag of this slot or 0 if it was never used
+    u8 prev_tag = u4_arr_get(slot_tags, slot_idx + 1);
+    u8 gen = metadata->arm_mte_gen[slot_idx];
+
+    if (gen == 255) {
+        // Generation counter saturated: fall back to random tagging to avoid
+        // silent wrap-around that would reduce deterministic UAF coverage.
+        // Exclude the previous tag of this slot to match original behavior.
+        tem |= (1 << prev_tag);
+        tagged_ptr = arm_mte_create_random_tag(slot_ptr, tem);
+        // slot addresses and sizes are always aligned by 16
+        arm_mte_tag_and_clear_mem(tagged_ptr, slot_size);
+    } else {
+        // Deterministic UAF: increment previous tag, skipping reserved tag (0)
+        u8 new_tag = prev_tag + 1;
+        if (new_tag == RESERVED_TAG) {
+            new_tag = 1;
+        }
+        // Wrap within 4-bit tag space (tags 1-15 are valid non-reserved tags)
+        if (new_tag > 0xf) {
+            new_tag = 1;
+        }
+
+        // Check for collision with neighbor tags and keep incrementing
+        // until a non-colliding tag is found (up to 15 attempts).
+        u8 left_tag = u4_arr_get(slot_tags, slot_idx);
+        u8 right_tag = u4_arr_get(slot_tags, slot_idx + 2);
+
+        for (unsigned i = 0; i < 15; i++) {
+            if (new_tag != left_tag && new_tag != right_tag) {
+                break;
+            }
+            new_tag = new_tag + 1;
+            if (new_tag == RESERVED_TAG) {
+                new_tag = 1;
+            }
+            if (new_tag > 0xf) {
+                new_tag = 1;
+            }
+            if (i == 14) {
+                // All 15 non-reserved tags collide with neighbors (extremely unlikely
+                // with only 2 neighbors): fall back to random tag.
+                tem |= (1 << prev_tag);
+                tagged_ptr = arm_mte_create_random_tag(slot_ptr, tem);
+                arm_mte_tag_and_clear_mem(tagged_ptr, slot_size);
+                goto out;
+            }
+        }
+
+        tagged_ptr = set_pointer_tag(slot_ptr, new_tag);
+        // slot addresses and sizes are always aligned by 16
+        arm_mte_tag_and_clear_mem(tagged_ptr, slot_size);
+    }
+
+    // Increment generation counter for this slot
+    metadata->arm_mte_gen[slot_idx] = gen + 1;
+#else
+    // Original random tag behavior: exclude previous tag of this slot
+    tem |= (1 << u4_arr_get(slot_tags, slot_idx + 1));
+    tagged_ptr = arm_mte_create_random_tag(slot_ptr, tem);
     // slot addresses and sizes are always aligned by 16
     arm_mte_tag_and_clear_mem(tagged_ptr, slot_size);
+#endif
 
+out:
     // store new tag of this slot
     u4_arr_set(slot_tags, slot_idx + 1, get_pointer_tag(tagged_ptr));
 
@@ -1114,8 +1183,15 @@ static inline void deallocate_small(void *p, const size_t *expected_size) {
         bool skip_zero = false;
 #ifdef HAS_ARM_MTE
         if (likely51(is_memtag_enabled())) {
-            arm_mte_tag_and_clear_mem(set_pointer_tag(p, RESERVED_TAG), size);
+#if CONFIG_MTE_DETERMINISTIC_UAF
+            // Store the current allocation tag in arm_mte_tags before retagging to
+            // RESERVED_TAG, so that tag_and_clear_slab_slot() knows the previous tag
+            // to increment from on the next allocation of this slot.
+            u4_arr_set(metadata->arm_mte_tags, slot + 1, get_pointer_tag(p));
+#else
             // metadata->arm_mte_tags is intentionally not updated, see tag_and_clear_slab_slot()
+#endif
+            arm_mte_tag_and_clear_mem(set_pointer_tag(p, RESERVED_TAG), size);
             skip_zero = true;
         }
 #endif

@@ -30,6 +30,7 @@ common_cflags = [
     "-DCONFIG_SELF_INIT=false",
     "-DCONFIG_ADAPTIVE_QUARANTINE=true",
     "-DCONFIG_QUARANTINE_MIN_SCALE=0.25",
+    "-DCONFIG_MTE_DETERMINISTIC_UAF=true",
 ]
 
 cc_defaults {
