@@ -28,6 +28,8 @@ common_cflags = [
     "-DN_ARENA=1",
     "-DCONFIG_STATS=true",
     "-DCONFIG_SELF_INIT=false",
+    "-DCONFIG_ADAPTIVE_QUARANTINE=true",
+    "-DCONFIG_QUARANTINE_MIN_SCALE=0.25",
 ]
 
 cc_defaults {

@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -9,6 +10,12 @@
 
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 #include "third_party/libdivide.h"
 
@@ -27,6 +34,35 @@
 #define SLAB_QUARANTINE (SLAB_QUARANTINE_RANDOM_LENGTH > 0 || SLAB_QUARANTINE_QUEUE_LENGTH > 0)
 #define REGION_QUARANTINE (REGION_QUARANTINE_RANDOM_LENGTH > 0 || REGION_QUARANTINE_QUEUE_LENGTH > 0)
 #define MREMAP_MOVE_THRESHOLD ((size_t)32 * 1024 * 1024)
+
+#if CONFIG_ADAPTIVE_QUARANTINE
+#if !SLAB_QUARANTINE
+#error "CONFIG_ADAPTIVE_QUARANTINE requires slab quarantine to be enabled"
+#endif
+
+#define ADAPTIVE_QUARANTINE_CHECK_INTERVAL_SECS 2
+#define ADAPTIVE_QUARANTINE_DOWNGRADE_THRESHOLD_SECS 5
+#define ADAPTIVE_QUARANTINE_UPGRADE_THRESHOLD_SECS 10
+#define ADAPTIVE_QUARANTINE_RAMP_UP_FRACTION_NUM 1
+#define ADAPTIVE_QUARANTINE_RAMP_UP_FRACTION_DEN 10
+
+enum quarantine_pressure_mode {
+    QUARANTINE_MODE_RELAXED,
+    QUARANTINE_MODE_NORMAL,
+    QUARANTINE_MODE_AGGRESSIVE
+};
+
+struct adaptive_quarantine_state {
+    pthread_t thread;
+    atomic_bool running;
+    atomic_int pressure_mode;
+    atomic_ulong pressure_mode_since;
+    bool meminfo_available;
+    bool is_low_ram_device;
+};
+
+static struct adaptive_quarantine_state adaptive_state;
+#endif
 
 static_assert(sizeof(void *) == 8, "64-bit only");
 
@@ -316,6 +352,11 @@ struct __attribute__((aligned(CACHELINE_SIZE))) size_class {
 
 #if SLAB_QUARANTINE_RANDOM_LENGTH > 0
     void *quarantine_random[SLAB_QUARANTINE_RANDOM_LENGTH << (MAX_SLAB_SIZE_CLASS_SHIFT - MIN_SLAB_SIZE_CLASS_SHIFT)];
+#endif
+
+#if CONFIG_ADAPTIVE_QUARANTINE
+    _Atomic size_t quarantine_active_random_length;
+    _Atomic size_t quarantine_active_queue_length;
 #endif
 };
 
@@ -800,6 +841,243 @@ static void enqueue_free_slab(struct size_class *c, struct slab_metadata *metada
     c->free_slabs_tail = substitute;
 }
 
+#if CONFIG_ADAPTIVE_QUARANTINE
+static size_t get_max_quarantine_random_length(size_t class) {
+    size_t size = size_classes[class];
+    if (size == 0) {
+        size = 16;
+    }
+    size_t quarantine_shift = clz64(size) - (63 - MAX_SLAB_SIZE_CLASS_SHIFT);
+    return SLAB_QUARANTINE_RANDOM_LENGTH << quarantine_shift;
+}
+
+static size_t get_max_quarantine_queue_length(size_t class) {
+    size_t size = size_classes[class];
+    if (size == 0) {
+        size = 16;
+    }
+    size_t quarantine_shift = clz64(size) - (63 - MAX_SLAB_SIZE_CLASS_SHIFT);
+    return SLAB_QUARANTINE_QUEUE_LENGTH << quarantine_shift;
+}
+
+static size_t compute_adaptive_length(size_t max_length, enum quarantine_pressure_mode mode) {
+    if (max_length == 0) {
+        return 0;
+    }
+    size_t min_length = (size_t)((double)max_length * CONFIG_QUARANTINE_MIN_SCALE);
+    if (min_length < 1) {
+        min_length = 1;
+    }
+    switch (mode) {
+        case QUARANTINE_MODE_RELAXED:
+            return max_length;
+        case QUARANTINE_MODE_NORMAL:
+            return max_length / 2;
+        case QUARANTINE_MODE_AGGRESSIVE:
+            return min_length;
+        default:
+            return max_length;
+    }
+}
+
+static bool read_meminfo_field(const char *field_name, unsigned long *value) {
+    int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    char buf[1024];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) {
+        return false;
+    }
+    buf[n] = '\0';
+    char *line = buf;
+    size_t field_len = strlen(field_name);
+    while (line && *line) {
+        if (strncmp(line, field_name, field_len) == 0) {
+            char *val_start = line + field_len;
+            while (*val_start == ' ' || *val_start == ':') {
+                val_start++;
+            }
+            *value = strtoul(val_start, NULL, 10);
+            return true;
+        }
+        line = strchr(line, '\n');
+        if (line) {
+            line++;
+        }
+    }
+    return false;
+}
+
+static bool check_psi_memory_pressure(void) {
+    int fd = open("/proc/pressure/memory", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    close(fd);
+    return true;
+}
+
+static bool detect_low_ram_device(void) {
+#ifdef __ANDROID__
+    char prop_value[PROP_VALUE_MAX];
+    if (__system_property_get("ro.config.low_ram", prop_value) > 0) {
+        return strcmp(prop_value, "true") == 0;
+    }
+#endif
+    return false;
+}
+
+static enum quarantine_pressure_mode determine_pressure_mode(void) {
+    if (adaptive_state.is_low_ram_device) {
+        return QUARANTINE_MODE_AGGRESSIVE;
+    }
+
+    if (!adaptive_state.meminfo_available) {
+        return QUARANTINE_MODE_RELAXED;
+    }
+
+    unsigned long mem_available = 0;
+    unsigned long mem_total = 0;
+    bool has_available = read_meminfo_field("MemAvailable", &mem_available);
+    bool has_total = read_meminfo_field("MemTotal", &mem_total);
+
+    if (!has_total || mem_total == 0) {
+        return QUARANTINE_MODE_RELAXED;
+    }
+
+    if (!has_available) {
+        return QUARANTINE_MODE_AGGRESSIVE;
+    }
+
+    double pressure_ratio = (double)mem_available / (double)mem_total;
+
+    if (pressure_ratio > 0.4) {
+        return QUARANTINE_MODE_RELAXED;
+    } else if (pressure_ratio > 0.2) {
+        return QUARANTINE_MODE_NORMAL;
+    } else {
+        return QUARANTINE_MODE_AGGRESSIVE;
+    }
+}
+
+static void update_quarantine_lengths_for_mode(enum quarantine_pressure_mode new_mode) {
+    for (unsigned arena = 0; arena < N_ARENA; arena++) {
+        for (unsigned class = 0; class < N_SIZE_CLASSES; class++) {
+            struct size_class *c = &ro.size_class_metadata[arena][class];
+
+            size_t max_random = get_max_quarantine_random_length(class);
+            size_t max_queue = get_max_quarantine_queue_length(class);
+            size_t target_random = compute_adaptive_length(max_random, new_mode);
+            size_t target_queue = compute_adaptive_length(max_queue, new_mode);
+
+            size_t current_random = atomic_load_explicit(&c->quarantine_active_random_length, memory_order_relaxed);
+            size_t current_queue = atomic_load_explicit(&c->quarantine_active_queue_length, memory_order_relaxed);
+
+            if (target_random < current_random) {
+                atomic_store_explicit(&c->quarantine_active_random_length, target_random, memory_order_relaxed);
+            } else if (target_random > current_random) {
+                size_t increment = max(1UL, current_random * ADAPTIVE_QUARANTINE_RAMP_UP_FRACTION_NUM / ADAPTIVE_QUARANTINE_RAMP_UP_FRACTION_DEN);
+                size_t new_random = current_random + increment;
+                if (new_random > target_random) {
+                    new_random = target_random;
+                }
+                atomic_store_explicit(&c->quarantine_active_random_length, new_random, memory_order_relaxed);
+            }
+
+            if (target_queue < current_queue) {
+                atomic_store_explicit(&c->quarantine_active_queue_length, target_queue, memory_order_relaxed);
+            } else if (target_queue > current_queue) {
+                size_t increment = max(1UL, current_queue * ADAPTIVE_QUARANTINE_RAMP_UP_FRACTION_NUM / ADAPTIVE_QUARANTINE_RAMP_UP_FRACTION_DEN);
+                size_t new_queue = current_queue + increment;
+                if (new_queue > target_queue) {
+                    new_queue = target_queue;
+                }
+                atomic_store_explicit(&c->quarantine_active_queue_length, new_queue, memory_order_relaxed);
+            }
+        }
+    }
+}
+
+static void *adaptive_quarantine_thread(UNUSED void *arg) {
+    while (atomic_load_explicit(&adaptive_state.running, memory_order_acquire)) {
+        enum quarantine_pressure_mode current_mode =
+            (enum quarantine_pressure_mode)atomic_load_explicit(&adaptive_state.pressure_mode, memory_order_relaxed);
+        enum quarantine_pressure_mode desired_mode = determine_pressure_mode();
+
+        unsigned long now = (unsigned long)time(NULL);
+        unsigned long mode_since = atomic_load_explicit(&adaptive_state.pressure_mode_since, memory_order_relaxed);
+        unsigned long duration = now > mode_since ? now - mode_since : 0;
+
+        if (desired_mode != current_mode) {
+            bool is_downgrade = desired_mode > current_mode;
+            unsigned long threshold = is_downgrade ?
+                ADAPTIVE_QUARANTINE_DOWNGRADE_THRESHOLD_SECS :
+                ADAPTIVE_QUARANTINE_UPGRADE_THRESHOLD_SECS;
+
+            if (duration >= threshold) {
+                atomic_store_explicit(&adaptive_state.pressure_mode, desired_mode, memory_order_relaxed);
+                atomic_store_explicit(&adaptive_state.pressure_mode_since, now, memory_order_relaxed);
+                current_mode = desired_mode;
+            }
+        } else {
+            atomic_store_explicit(&adaptive_state.pressure_mode_since, now, memory_order_relaxed);
+        }
+
+        update_quarantine_lengths_for_mode(current_mode);
+
+        for (int i = 0; i < ADAPTIVE_QUARANTINE_CHECK_INTERVAL_SECS; i++) {
+            if (!atomic_load_explicit(&adaptive_state.running, memory_order_acquire)) {
+                return NULL;
+            }
+            sleep(1);
+        }
+    }
+    return NULL;
+}
+
+static void adaptive_quarantine_init(void) {
+    adaptive_state.meminfo_available = false;
+    adaptive_state.is_low_ram_device = false;
+
+    int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        close(fd);
+        adaptive_state.meminfo_available = true;
+    }
+
+    adaptive_state.is_low_ram_device = detect_low_ram_device();
+    check_psi_memory_pressure();
+
+    atomic_store_explicit(&adaptive_state.pressure_mode, QUARANTINE_MODE_RELAXED, memory_order_relaxed);
+    atomic_store_explicit(&adaptive_state.pressure_mode_since, (unsigned long)time(NULL), memory_order_relaxed);
+
+    for (unsigned arena = 0; arena < N_ARENA; arena++) {
+        for (unsigned class = 0; class < N_SIZE_CLASSES; class++) {
+            struct size_class *c = &ro.size_class_metadata[arena][class];
+            size_t max_random = get_max_quarantine_random_length(class);
+            size_t max_queue = get_max_quarantine_queue_length(class);
+            atomic_store_explicit(&c->quarantine_active_random_length, max_random, memory_order_relaxed);
+            atomic_store_explicit(&c->quarantine_active_queue_length, max_queue, memory_order_relaxed);
+        }
+    }
+
+    atomic_store_explicit(&adaptive_state.running, true, memory_order_release);
+
+    if (unlikely(pthread_create(&adaptive_state.thread, NULL, adaptive_quarantine_thread, NULL))) {
+        atomic_store_explicit(&adaptive_state.running, false, memory_order_release);
+        return;
+    }
+}
+
+static void UNUSED adaptive_quarantine_cleanup(void) {
+    atomic_store_explicit(&adaptive_state.running, false, memory_order_release);
+    pthread_join(adaptive_state.thread, NULL);
+}
+#endif
+
 // preserves errno
 static inline void deallocate_small(void *p, const size_t *expected_size) {
     struct slab_size_class_info size_class_info = slab_size_class(p);
@@ -854,43 +1132,57 @@ static inline void deallocate_small(void *p, const size_t *expected_size) {
 
     set_quarantine_slot(metadata, slot);
 
+#if !CONFIG_ADAPTIVE_QUARANTINE
     size_t quarantine_shift = clz64(size) - (63 - MAX_SLAB_SIZE_CLASS_SHIFT);
+#endif
 
 #if SLAB_QUARANTINE_RANDOM_LENGTH > 0
-    size_t slab_quarantine_random_length = SLAB_QUARANTINE_RANDOM_LENGTH << quarantine_shift;
-
-#if (SLAB_QUARANTINE_RANDOM_LENGTH << (MAX_SLAB_SIZE_CLASS_SHIFT - MIN_SLAB_SIZE_CLASS_SHIFT)) <= UINT16_MAX
-    size_t random_index = get_random_u16_uniform(&c->rng, slab_quarantine_random_length);
+#if CONFIG_ADAPTIVE_QUARANTINE
+    size_t slab_quarantine_random_length = atomic_load_explicit(&c->quarantine_active_random_length, memory_order_relaxed);
 #else
-    size_t random_index = get_random_u32_uniform(&c->rng, slab_quarantine_random_length);
+    size_t slab_quarantine_random_length = SLAB_QUARANTINE_RANDOM_LENGTH << quarantine_shift;
 #endif
-    void *random_substitute = c->quarantine_random[random_index];
-    c->quarantine_random[random_index] = p;
 
-    if (random_substitute == NULL) {
-        mutex_unlock(&c->lock);
-        return;
+    if (slab_quarantine_random_length > 0) {
+#if (SLAB_QUARANTINE_RANDOM_LENGTH << (MAX_SLAB_SIZE_CLASS_SHIFT - MIN_SLAB_SIZE_CLASS_SHIFT)) <= UINT16_MAX
+        size_t random_index = get_random_u16_uniform(&c->rng, slab_quarantine_random_length);
+#else
+        size_t random_index = get_random_u32_uniform(&c->rng, slab_quarantine_random_length);
+#endif
+        void *random_substitute = c->quarantine_random[random_index];
+        c->quarantine_random[random_index] = p;
+
+        if (random_substitute == NULL) {
+            mutex_unlock(&c->lock);
+            return;
+        }
+
+        p = random_substitute;
     }
-
-    p = random_substitute;
 #endif
 
 #if SLAB_QUARANTINE_QUEUE_LENGTH > 0
+#if CONFIG_ADAPTIVE_QUARANTINE
+    size_t slab_quarantine_queue_length = atomic_load_explicit(&c->quarantine_active_queue_length, memory_order_relaxed);
+#else
     size_t slab_quarantine_queue_length = SLAB_QUARANTINE_QUEUE_LENGTH << quarantine_shift;
+#endif
 
-    void *queue_substitute = c->quarantine_queue[c->quarantine_queue_index];
-    c->quarantine_queue[c->quarantine_queue_index] = p;
+    if (slab_quarantine_queue_length > 0) {
+        void *queue_substitute = c->quarantine_queue[c->quarantine_queue_index];
+        c->quarantine_queue[c->quarantine_queue_index] = p;
 
-    // Modulo here is costly so we're using an increment and an if instead.
-    size_t next_queue_index = c->quarantine_queue_index + 1;
-    c->quarantine_queue_index = next_queue_index < slab_quarantine_queue_length ? next_queue_index : 0;
+        // Modulo here is costly so we're using an increment and an if instead.
+        size_t next_queue_index = c->quarantine_queue_index + 1;
+        c->quarantine_queue_index = next_queue_index < slab_quarantine_queue_length ? next_queue_index : 0;
 
-    if (queue_substitute == NULL) {
-        mutex_unlock(&c->lock);
-        return;
+        if (queue_substitute == NULL) {
+            mutex_unlock(&c->lock);
+            return;
+        }
+
+        p = queue_substitute;
     }
-
-    p = queue_substitute;
 #endif
 
     metadata = get_metadata(c, p);
@@ -1230,6 +1522,11 @@ static void post_fork_child(void) {
         }
     }
     thread_seal_metadata();
+
+#if CONFIG_ADAPTIVE_QUARANTINE
+    // The old thread no longer exists in the forked child; start a new one.
+    adaptive_quarantine_init();
+#endif
 }
 
 static inline bool is_init(void) {
@@ -1340,6 +1637,10 @@ COLD static void init_slow_path(void) {
     if (unlikely(pthread_atfork(full_lock, full_unlock, post_fork_child))) {
         fatal_error("pthread_atfork failed");
     }
+
+#if CONFIG_ADAPTIVE_QUARANTINE
+    adaptive_quarantine_init();
+#endif
 }
 
 static inline unsigned init(void) {

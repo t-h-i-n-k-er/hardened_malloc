@@ -79,7 +79,9 @@ EXECUTABLES := \
     calloc_overflow \
     calloc_zeroed \
     malloc_zero_different \
-    malloc_noreuse
+    malloc_noreuse \
+    test_adaptive_quarantine_pressure \
+    test_adaptive_quarantine_floor
 
 all: $(EXECUTABLES)
 
